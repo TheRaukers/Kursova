@@ -1,0 +1,251 @@
+import sys
+import threading
+import logging
+from urllib.parse import quote_plus
+
+from PySide6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QComboBox,
+    QPushButton, QTableWidget, QTableWidgetItem, QLabel
+)
+from PySide6.QtCore import Qt, QEvent, QObject
+
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from PySide6.QtCore import QTimer
+# Налаштування логування
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('abit_poisk.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+DIRECTION_IDS = {
+    "КН": {
+        "2024": "1331272",
+        "2023": "1190568",
+        "2022": "998668",
+        "2021": "868050",
+        "2020": "740810"
+    },
+    "ІПЗ": {
+        "2024": "1353618",
+        "2023": "1219021",
+        "2022": "1004297",
+        "2021": "881151",
+        "2020": "761189"
+    },
+    "ІСТ": {
+        "2024": "1329705",
+        "2023": "1190371",
+        "2022": "998345",
+        "2021": "867502",
+        "2020": "740146"
+    }
+}
+
+class AbitPoiskApp(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("AbitPoisk Рейтинговий Список")
+        self.resize(1000, 600)
+
+        layout = QVBoxLayout(self)
+
+        self.spec_combo = QComboBox()
+        self.spec_combo.addItem("Оберіть спеціальність")
+        self.spec_combo.addItems(DIRECTION_IDS.keys())
+        layout.addWidget(self.spec_combo)
+
+        self.year_combo = QComboBox()
+        self.year_combo.addItem("Оберіть рік")
+        self.year_combo.addItems([str(y) for y in range(2020, 2025)])
+        layout.addWidget(self.year_combo)
+
+        self.load_btn = QPushButton("Завантажити рейтинг")
+        self.load_btn.setEnabled(False)
+        layout.addWidget(self.load_btn)
+
+        self.status_label = QLabel("Оберіть спеціальність та рік")
+        layout.addWidget(self.status_label)
+
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(["№", "ПІБ", "Пріоритет", "Бали", "Статус", "Квота", "ПВМ/ВЗ"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.table)
+
+        self.spec_combo.currentIndexChanged.connect(self.check_ready)
+        self.year_combo.currentIndexChanged.connect(self.check_ready)
+        self.load_btn.clicked.connect(self.load_ratings)
+        self.table.cellClicked.connect(self.on_table_click)
+
+        self.current_spec = None
+        self.current_year = None
+
+    def check_ready(self):
+        ready = self.spec_combo.currentIndex() > 0 and self.year_combo.currentIndex() > 0
+        self.load_btn.setEnabled(ready)
+
+    def load_ratings(self):
+        self.load_btn.setEnabled(False)
+        self.current_spec = self.spec_combo.currentText()
+        self.current_year = self.year_combo.currentText()
+        self.status_label.setText("Завантаження рейтингового списку...")
+        self.table.setRowCount(0)
+        logger.info(f"Початок завантаження даних для {self.current_spec} {self.current_year}")
+        threading.Thread(target=self.fetch_ratings, daemon=True).start()
+
+    def fetch_ratings(self):
+        try:
+            direction_id = DIRECTION_IDS.get(self.current_spec, {}).get(self.current_year)
+            year = self.current_year
+            url = f"https://abit-poisk.org.ua/rate{year}/direction/{direction_id}"
+            logger.debug(f"Спроба отримати дані з URL: {url}")
+            
+            data = self.get_table_data(url)
+            if data:
+                logger.info(f"Отримано {len(data)} записів")
+                self.update_table(data, is_personal=False)
+                self.update_status(f"✅ Завантажено {len(data)} записів")
+            else:
+                logger.warning("Не вдалося отримати дані або таблиця порожня")
+                self.update_status("❌ Не вдалося завантажити дані або таблиця порожня")
+        except Exception as e:
+            logger.error(f"Помилка у fetch_ratings: {str(e)}", exc_info=True)
+            self.update_status(f"‼️ Помилка: {e}")
+        finally:
+            QTimer.singleShot(0, lambda: self.load_btn.setEnabled(True))
+
+
+    def get_table_data(self, url, is_personal=False):
+        options = Options()
+        options.add_argument("--headless")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--window-size=1920,1080")
+        options.add_argument("--user-agent=Mozilla/5.0")
+
+        driver = None
+        try:
+            driver = webdriver.Chrome(options=options)
+            driver.get(url)
+
+            table = WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "table.table.table-bordered.table-hover"))
+            )
+
+            rows = table.find_elements(By.CSS_SELECTOR, "tbody tr")
+            data = []
+            for i, row in enumerate(rows):
+                #if i >= 20:  # обмеження до 20 записів
+                #    break
+
+                cells = row.find_elements(By.TAG_NAME, "td")
+                if not cells:
+                    continue
+
+                print(f"Рядок {i}: {[cell.text for cell in cells]}")
+
+                if not is_personal:
+                    if len(cells) >= 7:
+                        data.append({
+                            "№": cells[0].text,
+                            "ПІБ": cells[1].text,
+                            "Пріоритет": cells[2].text,
+                            "Бали": cells[3].text,
+                            "Статус": cells[4].text,
+                            "Квота": cells[6].text,
+                            "ПВМ/ВЗ": "+" if cells[7].text.strip() == "done_all" else cells[7].text,
+                        })
+                else:
+                    if len(cells) >= 14:
+                        data.append({
+                            "№": cells[3].text,
+                            "ПІБ": cells[1].text,
+                            "Пріоритет": cells[4].text,
+                            "Бали": cells[6].text,
+                            "Статус": cells[2].text,
+                            "Квота": cells[12].text,
+                            "Спеціальність": cells[11].text,
+                        })
+
+            return data
+        except Exception as e:
+            logger.error(f"Помилка у get_table_data: {str(e)}", exc_info=True)
+            if driver:
+                logger.debug("HTML сторінки:\n" + driver.page_source[:3000])
+            return None
+        finally:
+            if driver:
+                driver.quit()
+
+    def update_table(self, data, is_personal=False):
+        headers = ["№", "ПІБ", "Пріоритет", "Бали", "Статус", "Квота", "Спеціальність" if is_personal else "ПВМ/ВЗ"]
+        self.table.setColumnCount(len(headers))
+        self.table.setHorizontalHeaderLabels(headers)
+        self.table.setRowCount(len(data))
+        for i, item in enumerate(data):
+            self.table.setItem(i, 0, QTableWidgetItem(item["№"]))
+            self.table.setItem(i, 1, QTableWidgetItem(item["ПІБ"]))
+            self.table.setItem(i, 2, QTableWidgetItem(item["Пріоритет"]))
+            self.table.setItem(i, 3, QTableWidgetItem(item["Бали"]))
+            self.table.setItem(i, 4, QTableWidgetItem(item["Статус"]))
+            self.table.setItem(i, 5, QTableWidgetItem(item["Квота"]))
+            self.table.setItem(i, 6, QTableWidgetItem(item["Спеціальність"] if is_personal else item["ПВМ/ВЗ"]))
+        logger.debug("Таблиця успішно оновлена")
+    def update_status(self, text):
+        QTimer.singleShot(0, lambda: self.status_label.setText(text))
+
+    def on_table_click(self, row, column):
+        pib_item = self.table.item(row, 1)
+        if pib_item:
+            query = f"{pib_item.text()} {self.current_year}"
+            self.status_label.setText(f"Пошук за: {query}")
+            logger.info(f"Пошук за ПІБ: {query}")
+            threading.Thread(target=self.search_by_pib, args=(query,), daemon=True).start()
+
+    def search_by_pib(self, query):
+        try:
+            encoded_query = quote_plus(query)
+            url = f"https://abit-poisk.org.ua/#search-{encoded_query}"
+            logger.debug(f"Пошуковий URL: {url}")
+            self.update_status("🔍 Виконується пошук...")
+
+
+            data = self.get_table_data(url, is_personal=True)
+            if data:
+                logger.info(f"Знайдено {len(data)} записів за запитом '{query}'")
+                self.update_table(data, is_personal=True)
+                self.update_status(f"🔍 Знайдено {len(data)} записів за запитом '{query}'")
+            else:
+                self.update_status("🔍 Нічого не знайдено за запитом")
+        except Exception as e:
+            logger.error(f"Помилка під час пошуку: {e}", exc_info=True)
+            self.update_status("‼️ Помилка під час пошуку")
+
+
+class _FunctionEvent(QEvent):
+    def __init__(self, func):
+        super().__init__(QEvent.User)
+        self.func = func
+
+class _EventFilter(QObject):
+    def eventFilter(self, obj, event):
+        if isinstance(event, _FunctionEvent):
+            event.func()
+            return True
+        return False
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.installEventFilter(_EventFilter())
+    window = AbitPoiskApp()
+    window.show()
+    sys.exit(app.exec())
